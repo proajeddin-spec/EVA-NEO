@@ -1,0 +1,178 @@
+name: Build EVA APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      generate_keystore:
+        description: "Generer un keystore (UNE fois, pour le mode release)"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Recuperer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Installer les outils de build
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git zip unzip autoconf libtool pkg-config zlib1g-dev libncurses-dev cmake libffi-dev
+          pip install buildozer==1.5.0 "cython==0.29.36" pillow
+
+      - name: Generer l'icone et le splash screen
+        run: python make_icons.py
+
+      - name: Installer le SDK Android et accepter les licences
+        run: |
+          SDK="$HOME/.buildozer/android/platform/android-sdk"
+          mkdir -p "$SDK"
+          curl -sL https://dl.google.com/android/repository/commandlinetools-linux-6514223_latest.zip -o /tmp/sdktools.zip
+          unzip -q /tmp/sdktools.zip -d "$SDK"
+          if [ -d "$SDK/cmdline-tools" ] && [ ! -d "$SDK/tools" ]; then
+            mv "$SDK/cmdline-tools" "$SDK/tools"
+          fi
+          mkdir -p "$SDK/licenses"
+          echo "8933bad161af4178b1185d1a37fbf41ea5269c55" > "$SDK/licenses/android-sdk-license"
+          echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" >> "$SDK/licenses/android-sdk-license"
+          echo "d56f5187479451eabf01fb78af6dfcb131a6481e" >> "$SDK/licenses/android-sdk-license"
+          echo "d975f751698a77b662f1254ddbeed3901e976f5a" >> "$SDK/licenses/android-sdk-license"
+          echo "84831b9409646a918e30573bab4c9c91346d8abd" > "$SDK/licenses/android-sdk-preview-license"
+
+      - name: Preparer buildozer.spec, p4a et patcher le manifest
+        run: |
+          mkdir -p core tools
+          [ -f core/__init__.py ] || echo "# package" > core/__init__.py
+          [ -f tools/__init__.py ] || echo "# package" > tools/__init__.py
+
+          {
+            echo '[app]'
+            echo 'title = EVA'
+            echo 'package.name = eva'
+            echo 'package.domain = org.eva'
+            echo 'source.dir = .'
+            echo 'source.include_exts = py,png,json,txt'
+            echo 'version = 1.0'
+            echo 'requirements = hostpython3==3.11.6,python3==3.11.6,kivy==2.3.0,pyjnius,requests'
+            echo 'orientation = portrait'
+            echo 'fullscreen = 0'
+            echo 'android.permissions = INTERNET,SEND_SMS'
+            echo 'android.api = 34'
+            echo 'android.minapi = 24'
+            echo 'android.ndk = 25b'
+            echo 'android.archs = arm64-v8a'
+            echo 'android.accept_license = True'
+            echo 'icon.filename = %(source.dir)s/icon.png'
+            echo 'presplash.filename = %(source.dir)s/presplash.png'
+            echo ''
+            echo '[buildozer]'
+            echo 'log_level = 2'
+          } > buildozer.spec
+
+          git clone --bare --quiet https://github.com/kivy/python-for-android.git /tmp/p4a.git
+          TAG=$(git --git-dir=/tmp/p4a.git tag -l | grep -E '^v?20[0-9]{2}\.[0-9]+\.[0-9]+$' | awk -F. '{y=$1; sub(/^v/,"",y); if (y+0 <= 2024) print}' | sort -V | tail -1 || true)
+          if [ -n "$TAG" ]; then
+            echo "p4a.branch = $TAG" >> buildozer.spec
+          fi
+          echo "=== Tag p4a: ${TAG:-master} ==="
+
+          P4A_DIR=".buildozer/android/platform/python-for-android"
+          mkdir -p "$(dirname "$P4A_DIR")"
+          if [ -n "$TAG" ]; then
+            git clone -q -b "$TAG" --single-branch https://github.com/kivy/python-for-android.git "$P4A_DIR"
+          else
+            git clone -q https://github.com/kivy/python-for-android.git "$P4A_DIR"
+          fi
+          MANIFEST="$P4A_DIR/pythonforandroid/bootstraps/sdl2/build/AndroidManifest.tmpl.xml"
+          if [ -f "$MANIFEST" ] && ! grep -q "<queries>" "$MANIFEST"; then
+            sed -i 's|<application|<queries><intent><action android:name="android.speech.action.RECOGNIZE_SPEECH"/></intent></queries><application|' "$MANIFEST"
+            echo "=== Manifest patche: reco vocale autorisee ==="
+          fi
+
+          echo "=== buildozer.spec final ==="
+          cat buildozer.spec
+
+      - name: Preparer le keystore (debug / release)
+        id: keystore
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          GEN_KS: ${{ inputs.generate_keystore }}
+        run: |
+          if [ -n "$KS_B64" ] && [ -n "$KS_PASS" ]; then
+            echo "$KS_B64" | base64 -d > /tmp/eva.keystore
+            echo -n "$KS_PASS" > /tmp/ks_pass
+            echo "mode=release" >> "$GITHUB_OUTPUT"
+            echo "=== Mode RELEASE ==="
+          elif [ "$GEN_KS" = "true" ]; then
+            PASS=$(openssl rand -hex 12)
+            keytool -genkeypair -keystore /tmp/eva.keystore -alias eva \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=EVA, OU=Personal, O=Personal, C=FR"
+            echo -n "$PASS" > /tmp/ks_pass
+            B64=$(base64 -w0 /tmp/eva.keystore)
+            {
+              echo "## Keystore EVA genere"
+              echo ""
+              echo "Copie ces 2 valeurs dans Settings > Secrets and variables > Actions :"
+              echo ""
+              echo "Secret 1 - KEYSTORE_BASE64 :"
+              echo '```'
+              echo "$B64"
+              echo '```'
+              echo "Secret 2 - KEYSTORE_PASSWORD :"
+              echo '```'
+              echo "$PASS"
+              echo '```'
+              echo ""
+              echo "IMPORTANT: supprime ce run apres (menu ... > Delete workflow run)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "mode=release" >> "$GITHUB_OUTPUT"
+            echo "=== Mode RELEASE (keystore neuf - voir le resume) ==="
+          else
+            echo "mode=debug" >> "$GITHUB_OUTPUT"
+            echo "=== Mode DEBUG ==="
+          fi
+
+      - name: Compiler l'APK
+        run: |
+          if [ -f /tmp/eva.keystore ]; then
+            buildozer -v android release
+          else
+            buildozer -v android debug
+          fi
+
+      - name: Signer l'APK release
+        if: steps.keystore.outputs.mode == 'release'
+        run: |
+          UNSIGNED=$(ls bin/*release*.apk 2>/dev/null | head -1)
+          if [ -z "$UNSIGNED" ]; then echo "APK release introuvable"; exit 1; fi
+          KS_PASS=$(cat /tmp/ks_pass)
+          BT=$(ls -d "$HOME/.buildozer/android/platform/android-sdk/build-tools/"*/ | sort -V | tail -n1)
+          "$BT/zipalign" -p -f 4 "$UNSIGNED" bin/aligned.apk
+          "$BT/apksigner" sign --ks /tmp/eva.keystore --ks-key-alias eva \
+            --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
+            --out bin/EVA-release.apk bin/aligned.apk
+          rm -f bin/aligned.apk "$UNSIGNED"
+          echo "=== APK signe: EVA-release.apk ==="
+
+      - name: Publier l'APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: eva-apk
+          path: bin/*.apk
